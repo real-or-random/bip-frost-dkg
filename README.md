@@ -1490,6 +1490,8 @@ An exception to this rule is `MAJOR` version zero (0.y.z) which is for developme
 The `MINOR` version is incremented whenever the inputs or the output of an algorithm changes in a backward-compatible way or new backward-compatible functionality is added.
 The `PATCH` version is incremented for other noteworthy changes (bug fixes, test vectors, important clarifications, etc.).
 
+* *Unreleased*:
+  * Fix blaming for infinite public shares: a public share at infinity no longer makes `coordinator_step1` or `participant_step2` fail with an unattributed `AssertionError`. Instead, the session is rejected in `coordinator_finalize` (blaming the participant with the infinite public share, which has signed the certificate), `participant_finalize` (blaming the coordinator), and recovery.
 * *0.3.0* (2026-07-30): Major expansion of the reference implementation with message serialization, comprehensive test coverage, and API refinements:
   * Add message serialization for all protocol messages, enabling byte-level interoperability between implementations.
   * Add optional recovery acknowledgment round: `participant_recovery_ack_sign` and `participant_recovery_acks_verify` let participants confirm receipt of recovery data before use.
