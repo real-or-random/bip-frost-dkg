@@ -170,6 +170,9 @@ class CoordinatorInvestigationMsg(NamedTuple):
 class ThresholdInfo(NamedTuple):
     t: int
     thresh_pk: bytes
+    # A pubshare may be infinity, serialized as 33 zero bytes. An honest party
+    # cannot attribute this before the session has a success certificate, so
+    # the check is deferred to the finalize and recover functions in chilldkg.
     pubshares: list[bytes]
 
 
@@ -307,6 +310,13 @@ def participant_step2(
             "participant_investigate() to determine a faulty party",
         )
 
+    # Our secshare is valid, so our pubshare is infinity only if our tweaked
+    # secshare is 0. Since the other parties do not know our own contribution
+    # to our secshare, this happens only with negligible probability. This
+    # ensures that we never sign an eq_input in which our own pubshare is
+    # infinity.
+    assert not pubshare_tweaked.infinity
+
     thresh_pk = sum_coms_tweaked.commitment_to_secret()
     pubshares = [
         sum_coms_tweaked.pubshare(i)
@@ -317,7 +327,7 @@ def participant_step2(
     threshold_info = ThresholdInfo(
         t,
         thresh_pk.to_bytes_compressed(),
-        [pubshare.to_bytes_compressed() for pubshare in pubshares],
+        [pubshare.to_bytes_compressed_with_infinity() for pubshare in pubshares],
     )
     eq_input = t.to_bytes(4, byteorder="big") + sum_coms.to_bytes()
     return secshare_tweaked.to_bytes(), threshold_info, eq_input
@@ -411,7 +421,7 @@ def coordinator_step(
     threshold_info = ThresholdInfo(
         t,
         thresh_pk.to_bytes_compressed(),
-        [pubshare.to_bytes_compressed() for pubshare in pubshares],
+        [pubshare.to_bytes_compressed_with_infinity() for pubshare in pubshares],
     )
     eq_input = t.to_bytes(4, byteorder="big") + sum_coms.to_bytes()
     return cmsg, threshold_info, eq_input

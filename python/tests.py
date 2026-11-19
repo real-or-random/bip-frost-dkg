@@ -10,6 +10,7 @@ from secrets import token_bytes as random_bytes
 from chilldkg_ref import chilldkg, encpedpop, simplpedpop
 from chilldkg_ref.util import (
     FaultyCoordinatorError,
+    FaultyParticipantError,
     FaultyParticipantOrCoordinatorError,
     UnknownFaultyParticipantOrCoordinatorError,
     tagged_hash_bip_dkg,
@@ -18,6 +19,8 @@ from chilldkg_ref.vss import VSS, Polynomial, VSSCommitment
 from example import simulate_chilldkg_full as simulate_chilldkg_full_example
 from gen_vector_utils.util import (
     assert_raises,
+    expect_exception,
+    expect_faulty_exception,
     params_asdict,
     params_from_dict,
     threshold_info_asdict,
@@ -1006,10 +1009,127 @@ def test_recovery_acknowledgment():
         assert False, "Expected exception"
 
 
+def test_infinite_pubshare():
+    # Issue #170: A pubshare at infinity must not make an honest party abort
+    # without blame, and must never be output.
+    t, n = 3, 3
+    hostseckeys = [random_bytes(32) for _ in range(n)]
+    params = chilldkg.SessionParams(
+        [chilldkg.hostpubkey_gen(sk) for sk in hostseckeys], t
+    )
+    prets1 = [
+        chilldkg.participant_step1(sk, params, random_bytes(32)) for sk in hostseckeys
+    ]
+    pstates1 = [pret[0] for pret in prets1]
+
+    def rush(attacker, victim):
+        # After seeing all other pmsgs1, the attacker shifts its coefficient of
+        # degree 1 such that the victim's pubshare becomes infinity.
+        pmsgs1 = [pret[1] for pret in prets1]
+        cstate, cmsg1 = chilldkg.coordinator_step1(pmsgs1, params)
+        pmsg = chilldkg.ParticipantMsg1.from_bytes(pmsgs1[attacker], t=t, n=n)
+        com = pmsg.enc_pmsg.simpl_pmsg.com
+        x_inv = Scalar(1) / Scalar(victim + 1)
+        if attacker == victim:
+            # The attacker knows its own secshare and keeps all shares valid.
+            pstate2, _ = chilldkg.participant_step2(
+                hostseckeys[victim], pstates1[victim], cmsg1, random_bytes(32)
+            )
+            delta = -Scalar.from_bytes_checked(pstate2.secshare) * x_inv
+            com.ges[1] = com.ges[1] + delta * G
+            for j in range(n):
+                pmsg.enc_pmsg.enc_shares[j] += delta * Scalar(j + 1)
+        else:
+            # The attacker cannot send shares matching its commitment.
+            pubshare = GE.from_bytes_compressed(cstate.threshold_info.pubshares[victim])
+            com.ges[1] = com.ges[1] - x_inv * pubshare
+        pmsgs1[attacker] = pmsg.to_bytes()
+        cstate, cmsg1 = chilldkg.coordinator_step1(pmsgs1, params)
+        assert cstate.threshold_info.pubshares[victim] == bytes(33)
+        return pmsgs1, cstate, cmsg1
+
+    def investigate(i, cmsg1, cinvs):
+        # Return a function running the investigation after participant i
+        # has detected an invalid secshare.
+        try:
+            chilldkg.participant_step2(
+                hostseckeys[i], pstates1[i], cmsg1, random_bytes(32)
+            )
+        except UnknownFaultyParticipantOrCoordinatorError as e:
+            return lambda e=e: chilldkg.participant_investigate(e, cinvs[i])
+        raise AssertionError("Expected exception")
+
+    # Participant 2 targets participant 1's pubshare. The coordinator proceeds,
+    # and all honest participants blame participant 2 via investigation.
+    pmsgs1, _, cmsg1 = rush(attacker=2, victim=1)
+    cinvs = chilldkg.coordinator_investigate(pmsgs1, params)
+    for i in [0, 1]:
+        expect_faulty_exception(
+            investigate(i, cmsg1, cinvs), FaultyParticipantOrCoordinatorError, 2
+        )
+
+    # The coordinator adds D to the summed commitment of degree 1 and subtracts
+    # it from the one of degree 2. This keeps participant 0's pubshare (x = 1),
+    # and moves participant 1's pubshare (x = 2) by 2*D - 4*D = -pubshare to
+    # infinity. Participant 0 proceeds, and the others blame the coordinator.
+    pmsgs1 = [pret[1] for pret in prets1]
+    cstate, cmsg1 = chilldkg.coordinator_step1(pmsgs1, params)
+    D = (
+        Scalar(1)
+        / Scalar(2)
+        * GE.from_bytes_compressed(cstate.threshold_info.pubshares[1])
+    )
+    cmsg1_parsed = chilldkg.CoordinatorMsg1.from_bytes(cmsg1, t=t, n=n)
+    nonconst = cmsg1_parsed.enc_cmsg.simpl_cmsg.sum_coms_to_nonconst_terms
+    nonconst[0], nonconst[1] = nonconst[0] + D, nonconst[1] - D
+    cmsg1 = cmsg1_parsed.to_bytes()
+    cinvs = chilldkg.coordinator_investigate(pmsgs1, params)
+    chilldkg.participant_step2(hostseckeys[0], pstates1[0], cmsg1, random_bytes(32))
+    for i in [1, 2]:
+        expect_exception(investigate(i, cmsg1, cinvs), FaultyCoordinatorError)
+
+    # Participant 1 makes its own pubshare infinity with valid shares and
+    # signs. The session is rejected in finalize and recovery.
+    _, cstate, cmsg1 = rush(attacker=1, victim=1)
+    pstates2 = {}
+    sigs = [b""] * n
+    for i in [0, 2]:
+        pstates2[i], pmsg2 = chilldkg.participant_step2(
+            hostseckeys[i], pstates1[i], cmsg1, random_bytes(32)
+        )
+        sigs[i] = chilldkg.ParticipantMsg2.from_bytes(pmsg2).sig
+    eq_input = pstates2[0].eq_input
+    sigs[1] = chilldkg.certeq_participant_step(
+        hostseckeys[1], 1, eq_input, random_bytes(32)
+    )
+    pmsgs2 = [chilldkg.ParticipantMsg2(sig).to_bytes() for sig in sigs]
+    expect_faulty_exception(
+        lambda: chilldkg.coordinator_finalize(cstate, pmsgs2),
+        FaultyParticipantError,
+        1,
+    )
+    cert = chilldkg.certeq_coordinator_step(sigs)
+    cmsg2 = chilldkg.CoordinatorMsg2(cert).to_bytes()
+    for pstate2 in pstates2.values():
+        expect_exception(
+            lambda: chilldkg.participant_finalize(pstate2, cmsg2),
+            FaultyCoordinatorError,
+        )
+    recovery_data = chilldkg.RecoveryData(eq_input + cert)
+    expect_exception(
+        lambda: chilldkg.coordinator_recover(recovery_data), chilldkg.RecoveryDataError
+    )
+    expect_exception(
+        lambda: chilldkg.participant_recover(hostseckeys[0], recovery_data),
+        chilldkg.RecoveryDataError,
+    )
+
+
 test_chilldkg_params_validate()
 test_vss_correctness()
 test_validate_threshold_info()
 test_recovery_acknowledgment()
+test_infinite_pubshare()
 for t, n in [(1, 1), (1, 2), (2, 2), (2, 3), (2, 5)]:
     test_correctness(t, n, simulate_simplpedpop)
     test_correctness(t, n, simulate_simplpedpop, investigation=True)

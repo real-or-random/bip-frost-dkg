@@ -378,6 +378,27 @@ class ThresholdInfo(NamedTuple):
 RecoveryData = NewType("RecoveryData", bytes)
 
 
+def threshold_info_find_infinite_pubshare(threshold_info: ThresholdInfo) -> int | None:
+    # Return the index of the first infinite pubshare, or None.
+    #
+    # This must be acted upon only after a valid success certificate has been
+    # verified. Before that, an infinite pubshare cannot be attributed: It may
+    # belong to an honest participant whose secshare is invalid due to some
+    # other faulty party. That participant will abort in participant_step2
+    # and determine the faulty party via the investigation procedure.
+    #
+    # However, an honest participant never signs an eq_input in which its own
+    # pubshare is infinity (see simplpedpop.participant_step2). So, if the
+    # certificate is valid, then the participant with the infinite pubshare
+    # has signed, and is thus faulty. Moreover, since this check depends only
+    # on eq_input, all honest parties (and recovery) reach the same verdict.
+    infinity = GE().to_bytes_compressed_with_infinity()
+    for i, pubshare in enumerate(threshold_info.pubshares):
+        if pubshare == infinity:
+            return i
+    return None
+
+
 ###
 ### Messages
 ###
@@ -797,6 +818,13 @@ def participant_finalize(
         raise FaultyCoordinatorError(
             "Coordinator has provided a certificate with an invalid signature"
         ) from e
+    if threshold_info_find_infinite_pubshare(threshold_info) is not None:
+        # An honest coordinator would have rejected this certificate in
+        # coordinator_finalize.
+        raise FaultyCoordinatorError(
+            "Coordinator has provided a certificate for a session with an "
+            "infinite public share"
+        )
     return secshare, threshold_info, RecoveryData(eq_input + cmsg2_parsed.cert)
 
 
@@ -958,6 +986,13 @@ def coordinator_finalize(
             e.participant_id,
             "Participant has provided an invalid signature for the certificate",
         ) from e
+    i = threshold_info_find_infinite_pubshare(threshold_info)
+    if i is not None:
+        raise FaultyParticipantError(
+            i,
+            "Participant has signed the certificate although its public share "
+            "is infinity",
+        )
     cmsg2 = CoordinatorMsg2(cert).to_bytes()
     return cmsg2, threshold_info, RecoveryData(eq_input + cert)
 
@@ -1037,8 +1072,10 @@ def recover_public(
     threshold_info = ThresholdInfo(
         t,
         thresh_pk.to_bytes_compressed(),
-        [pubshare.to_bytes_compressed() for pubshare in pubshares],
+        [pubshare.to_bytes_compressed_with_infinity() for pubshare in pubshares],
     )
+    if threshold_info_find_infinite_pubshare(threshold_info) is not None:
+        raise RecoveryDataError("Infinite public share in recovery data")
     return threshold_info, params, (pubnonces, enc_secshares, tweak)
 
 
